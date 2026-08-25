@@ -1,0 +1,4 @@
+uv = "0.12.2"
+
+[settings]
+auto-install = true
