@@ -1,125 +1,144 @@
-import os
+import re
 import json
-import pandas as pd
+import os
+
 import requests
-from bs4 import BeautifulSoup
-from google import genai
-from google.genai import types
-
-# Environment variables
-ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-CSV_FILE = "ADs_list.csv"
-
-# Target URL (Example: Search listings for Fontainebleau/Avon)
-TARGET_URL = "https://www.iadfrance.fr/en/ads/fontainebleau-77300/sale"
-
-# Initialize Gemini Client
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+from bs4 import BeautifulSoup, Tag
+from pydantic import SecretStr
 
 
-def fetch_html_via_zenrows(url):
-    endpoint = "https://api.zenrows.com/v1/"
-    params = {
-        "api_key": ZENROWS_API_KEY,
-        "url": url,
-        "js_render": "true",  # Enables JS rendering if needed
-    }
-    response = requests.get(endpoint, params=params)
-    response.raise_for_status()
-    return response.text
+class ZenRowsScraper:
+    """Handles fetching and parsing web pages using ZenRows proxy and anti-bot bypass."""
 
+    def __init__(self, api_key: str | SecretStr | None = None) -> None:
+        """Initialize ZenRows scraper client.
 
-def analyze_listing_with_gemini(raw_text):
-    prompt = f"""
-    Analyze this French real estate text and output structured JSON data:
-    
-    1. "has_garden": boolean (true if private garden/terrace is available, false otherwise)
-    2. "floor": string or integer (e.g., "Ground Floor", "2nd Floor", "Top Floor")
-    3. "flaws_and_drawbacks": array of strings (e.g., ["Street noise", "No elevator", "Major renovation needed", "Ground floor street side"])
-    4. "highlights": array of strings (e.g., ["Balcony", "Quiet area", "Cellar included"])
-    
-    Listing Text:
-    {raw_text}
-    """
+        Args:
+            api_key: Optional ZenRows API key override or SecretStr.
+        """
+        if api_key is None:
+            resolved_key = os.environ.get("ZENROWS_API_KEY", "")
+        elif isinstance(api_key, SecretStr):
+            resolved_key = api_key.get_secret_value()
+        else:
+            resolved_key = api_key
 
-    # Force JSON output structure using Gemini 1.5 Flash
-    response = ai_client.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
-    return json.loads(response.text)
+        if not resolved_key:
+            raise ValueError("ZENROWS_API_KEY is not configured or is empty.")
 
+        self.api_key = resolved_key
+        self.endpoint = "https://api.zenrows.com/v1/"
 
-def main():
-    # Load or initialize DataFrame
-    try:
-        df = pd.read_csv(CSV_FILE)
-    except FileNotFoundError:
-        df = pd.DataFrame(
-            columns=[
-                "Status",
-                "Website link",
-                "Location",
-                "Room num",
-                "Size (sqm)",
-                "Price",
-                "Price/sqm",
-                "Garden",
-                "Floor",
-                "Drawbacks",
-                "Highlights",
-            ]
+    def fetch_page(self, target_url: str) -> str:
+        """Fetch raw HTML content from target URL via ZenRows API with antibot bypass.
+
+        Args:
+            target_url: URL of the target real estate search/listing page.
+
+        Returns:
+            String containing rendered HTML source.
+        """
+        params = {
+            "api_key": self.api_key,
+            "url": target_url,
+            "js_render": "true",
+            "premium_proxy": "true",
+        }
+
+        response = requests.get(self.endpoint, params=params)
+        response.raise_for_status()
+        return response.text
+
+    def extract_listing_cards(self, html_content: str) -> list[dict]:
+        soup = BeautifulSoup(html_content, "html.parser")
+        script_tag = soup.find("script", id="__UFRN_FETCHER__")
+
+        if not script_tag or not script_tag.string:
+            return []
+
+        match = re.search(r'JSON\.parse\("(.*?)"\);', script_tag.string)
+        if not match:
+            return []
+
+        # Fix UTF-8 encoding without double-encoding artifacts
+        raw_json_str = match.group(1)
+        # Replacing escaped quotes and backslashes directly keeps UTF-8 intact
+        clean_json = raw_json_str.replace('\\"', '"').replace("\\\\", "\\")
+        data = json.loads(clean_json)
+
+        classifieds_dict = (
+            data.get("data", {})
+            .get("classified-serp-init-data", {})
+            .get("pageProps", {})
+            .get("classifiedsData", {})
         )
 
-    print("Fetching page via ZenRows...")
-    html_content = fetch_html_via_zenrows(TARGET_URL)
-    soup = BeautifulSoup(html_content, "html.parser")
+        listings = []
+        for card_id, item in classifieds_dict.items():
+            hard_facts = item.get("hardFacts", {})
+            location = item.get("location", {}).get("address", {})
 
-    # Adapt selectors according to target portal HTML structure
-    cards = soup.select(".card-ad")
-    new_rows = []
+            # Extract location cleanly
+            city = location.get("city", "")
+            district = location.get("district", "")
+            full_location = f"{district}, {city}".strip(", ") if district else city
 
-    for card in cards:
-        link = card.find("a", href=True)["href"] if card.find("a", href=True) else ""
-        if not link or link in df["🔗 Link"].values:
-            continue  # Skip already processed listings
+            # Garden check from keyfacts
+            key_facts = [str(kf).lower() for kf in hard_facts.get("keyfacts", [])]
+            has_garden = any(
+                "jardin" in kf or "terrain" in kf or "terrasse" in kf
+                for kf in key_facts
+            )
 
-        card_text = card.get_text(separator=" ", strip=True)
+            # Floor check from facts
+            floor_info = "N/A"
+            for fact in hard_facts.get("facts", []):
+                if fact.get("type") in ("numberOfFloors", "floor", "buildingFloor"):
+                    val = str(fact.get("value", "")).strip()
+                    if val and val != "0":
+                        floor_info = val
+                elif fact.get("type") in ("plotSpace", "landSpace"):
+                    has_garden = True
 
-        # Analyze unstructured text with Gemini
-        ai_data = analyze_listing_with_gemini(card_text)
+            listings.append(
+                {
+                    "link": item.get("url", ""),
+                    "location": full_location,
+                    "price": float(hard_facts.get("price", {}).get("value", 0)),
+                    "size_sqm": float(
+                        next(
+                            (
+                                f.get("splitValue", 0)
+                                for f in hard_facts.get("facts", [])
+                                if f.get("type") in ("livingSpace", "overallSpace")
+                            ),
+                            0,
+                        )
+                    ),
+                    "room_num": int(
+                        next(
+                            (
+                                f.get("splitValue", 0)
+                                for f in hard_facts.get("facts", [])
+                                if f.get("type") == "numberOfRooms"
+                            ),
+                            0,
+                        )
+                    ),
+                    "bedroom_num": int(
+                        next(
+                            (
+                                f.get("splitValue", 0)
+                                for f in hard_facts.get("facts", [])
+                                if f.get("type") == "numberOfBedrooms"
+                            ),
+                            0,
+                        )
+                    ),
+                    "has_garden": has_garden,
+                    "floor": floor_info,
+                    "text": f"{hard_facts.get('title', '')}. {item.get('mainDescription', {}).get('description', '')}",
+                }
+            )
 
-        # Extract basic metrics
-        price = 0.0  # Parse price float from card
-        sqm = 0.0  # Parse surface float from card
-        price_per_sqm = round(price / sqm, 2) if sqm > 0 else None
-
-        new_rows.append(
-            {
-                "Status": "New",
-                "🔗 Link": link,
-                "Location": "Fontainebleau / Avon",
-                "Room num": None,
-                "Size (sqm)": sqm,
-                "Price": price,
-                "Price/sqm": price_per_sqm,
-                "Garden": "Yes" if ai_data.get("has_garden") else "No",
-                "Floor": ai_data.get("floor", "Unknown"),
-                "Drawbacks": ", ".join(ai_data.get("flaws_and_drawbacks", [])),
-                "Highlights": ", ".join(ai_data.get("highlights", [])),
-            }
-        )
-
-    if new_rows:
-        df_new = pd.DataFrame(new_rows)
-        df_updated = pd.concat([df, df_new], ignore_index=True)
-        df_updated.to_csv(CSV_FILE, index=False)
-        print(f"Added {len(new_rows)} new listings to CSV.")
-    else:
-        print("No new listings found.")
-
-
-if __name__ == "__main__":
-    main()
+        return listings

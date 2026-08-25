@@ -1,45 +1,32 @@
-import json
 from google import genai
-from google.genai import types
-
-from src.config import Config
-from src.domain.models import AIAnalysisResult
 
 
 class GeminiAnalyzer:
-    def __init__(self, api_key: str = Config.GEMINI_API_KEY) -> None:
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY is not configured.")
-        self.client = genai.Client(api_key=api_key)
+    """Uses the official Google GenAI SDK to analyze real estate listing descriptions."""
 
-    def analyze_listing_text(self, text: str) -> AIAnalysisResult:
-        prompt = f"""
-        Analyze this French real estate listing description and extract structured JSON:
-        1. "location": string (Extract the city or town name, e.g., "Fontainebleau", "Avon", "Paris", "Melun")
-        2. "has_garden": boolean (true if a private garden or terrace is available)
-        3. "floor": string (e.g., "Ground Floor", "2nd Floor", "Top Floor", or "Unknown")
-        4. "flaws_and_drawbacks": list of strings (e.g., ["Street noise", "No elevator", "Renovation needed"])
-        5. "highlights": list of strings (e.g., ["Balcony", "Quiet area", "Cellar"])
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+        # Initialize client with your API key explicitly
+        self.client = genai.Client(api_key=self.api_key)
 
-        Listing Text:
-        {text}
-        """
+    def analyze_description(self, description: str) -> str:
+        if not description or not description.strip():
+            return "No description provided."
 
-        response = self.client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        prompt = (
+            "Analyze the following real estate listing description and provide a short summary "
+            "(3 bullet points max) highlighting key pros, cons, or hidden details:\n\n"
+            f"{description}"
         )
 
         try:
-            data = json.loads(response.text)
-        except (json.JSONDecodeError, TypeError):
-            return AIAnalysisResult()
+            # Use gemini-3.7-flash with the standard contents endpoint
+            response = self.client.models.generate_content(
+                model="gemini-3.7-flash",
+                contents=prompt,
+            )
+            return response.text.strip() if response.text else "No analysis generated."
 
-        return AIAnalysisResult(
-            extracted_location=str(data.get("location", "Unknown")),
-            has_garden=bool(data.get("has_garden", False)),
-            floor=str(data.get("floor", "Unknown")),
-            flaws_and_drawbacks=list(data.get("flaws_and_drawbacks", [])),
-            highlights=list(data.get("highlights", [])),
-        )
+        except Exception as e:
+            print(f"[ERROR] Gemini analysis failed: {e}")
+            return "Analysis unavailable."

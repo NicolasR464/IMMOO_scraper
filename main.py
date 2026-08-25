@@ -1,38 +1,42 @@
-from typing import Annotated
+import traceback
 
-from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, status
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
 
-from src.cli import run_pipeline
-from src.types.requests import ScrapeRequest
-from src.utils import get_project_version
-from src.utils.api_checker import verify_api_key
+from src.pipeline import run_pipeline
+from src.services.streamestate_client import StreamEstateError
 
-APP_VERSION = get_project_version()
-
-app = FastAPI(title="IMMOO Scraper Service", version=APP_VERSION)
-
-# Create router with /api prefix
-api_router = APIRouter(prefix="/api")
-
-# Dependency wrapper (extracts verified token string)
-ApiKeyDep = Annotated[str, Depends(verify_api_key)]
+app = FastAPI()
 
 
-def execute_pipeline(payload: ScrapeRequest):
-    # Run pipeline with dynamic payload from client
-    run_pipeline(payload)
+class SearchPayload(BaseModel):
+    locations: list[str]
+    minPrice: float = 0.0
+    maxPrice: float = 0.0
+    minSpace: float = 0.0
+    minRooms: int = 1
+    minBedrooms: int = 1
 
 
-@api_router.get("/health")
-def health_check():
-    return {"status": "online", "version": APP_VERSION}
+@app.post("/api/search")
+async def search_listings(
+    payload: SearchPayload,
+    authorization: str | None = Header(
+        default=None
+    ),  # Explicitly parses HTTP Authorization Header
+):
+    try:
+        access_token = ""
+        if authorization and authorization.startswith("Bearer "):
+            access_token = authorization.split(" ")[1]
 
-
-@api_router.post("/scrape", status_code=status.HTTP_202_ACCEPTED)
-async def trigger_scrape(payload: ScrapeRequest, background_tasks: BackgroundTasks):
-    # Pass the client payload directly to the background task
-    background_tasks.add_task(execute_pipeline, payload)
-    return {"success": True, "message": "Scraping pipeline queued successfully!"}
-
-
-app.include_router(api_router)
+        run_pipeline(payload, access_token=access_token)
+        return {
+            "status": "success",
+            "message": "Property search completed successfully.",
+        }
+    except StreamEstateError as api_err:
+        raise HTTPException(status_code=402, detail=str(api_err))
+    except Exception as err:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(err))
