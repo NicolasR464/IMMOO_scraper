@@ -1,8 +1,12 @@
+import os
 import time
+from pathlib import Path
 
-import gspread
 from google.auth.credentials import Credentials
 from google.auth.transport.requests import Request
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import gspread
 from gspread.utils import a1_range_to_grid_range
 from gspread_formatting import (
     CellFormat,
@@ -15,7 +19,12 @@ from gspread_formatting import (
 )
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
+from src.config import settings
 from src.enums.table import ColumnHeader, StatusEnum
+
+# Automatically resolves to the root folder of your project
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DEFAULT_SERVICE_ACCOUNT_PATH = str(BASE_DIR / "service_account.json")
 
 
 class StaticAccessTokenCredentials(Credentials):
@@ -48,65 +57,104 @@ class GoogleSheetsStorageConfig(BaseModel):
 
 
 class GoogleSheetsStorage:
-    """Handles interactions with Google Sheets using temporary user OAuth access tokens."""
+    """Handles interactions with Google Sheets using backend Service Account.
+
+    Clones a Master Template containing bound Apps Script protections when
+    creating new sheets inside Shared Drives.
+    """
 
     client: gspread.Client
     sheet: gspread.Worksheet
+    spreadsheet: gspread.Spreadsheet
 
     def __init__(
         self,
-        access_token: str | SecretStr,
+        master_template_id: str,
+        user_email: str | None = None,
         spreadsheet_id: str | None = None,
         sheet_name: str = "ADs_list",
+        service_account_file: str = DEFAULT_SERVICE_ACCOUNT_PATH,
     ) -> None:
-        """Initialize Google Sheets client using validated Pydantic settings."""
-        token_secret = (
-            access_token
-            if isinstance(access_token, SecretStr)
-            else SecretStr(access_token)
+        """Initialize Google Sheets client using backend Service Account."""
+        if not os.path.exists(service_account_file):
+            raise FileNotFoundError(
+                f"Service account file '{service_account_file}' not found."
+            )
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+
+        # 1. Authenticate with Service Account
+        self.creds = service_account.Credentials.from_service_account_file(
+            service_account_file, scopes=scopes
         )
-        config = GoogleSheetsStorageConfig(
-            access_token=token_secret,
-            spreadsheet_id=spreadsheet_id,
-            sheet_name=sheet_name,
-        )
+        self.client = gspread.authorize(self.creds)
+        self.drive_service = build("drive", "v3", credentials=self.creds)
 
-        raw_token = config.access_token.get_secret_value().strip()
-        if not raw_token:
-            raise ValueError("Google OAuth access_token cannot be empty.")
-
-        # Wrap token in non-refreshable credentials subclass
-        creds = StaticAccessTokenCredentials(raw_token)
-        self.client = gspread.authorize(creds)
-
-        # Open sheet by explicit Key (ID) or fallback to Title search / creation
         try:
-            if config.spreadsheet_id:
-                print(f"[STORAGE] Opening sheet by ID: {config.spreadsheet_id}")
-                self.sheet = self.client.open_by_key(config.spreadsheet_id).sheet1
+            # 2. Open existing sheet OR clone from Master Template
+            if spreadsheet_id:
+                print(f"[STORAGE] Opening existing sheet by ID: {spreadsheet_id}")
+                self.spreadsheet = self.client.open_by_key(spreadsheet_id)
             else:
-                print(f"[STORAGE] Searching for sheet by Title: '{config.sheet_name}'")
-                try:
-                    self.sheet = self.client.open(config.sheet_name).sheet1
-                except gspread.exceptions.SpreadsheetNotFound:
-                    print(
-                        f"[STORAGE] Sheet '{config.sheet_name}' not found. Creating a new document..."
+                if not master_template_id:
+                    raise ValueError(
+                        "master_template_id must be provided when spreadsheet_id is None."
                     )
-                    sh = self.client.create(config.sheet_name)
-                    self.sheet = sh.sheet1
 
+                staging_folder_id = settings.google_drive_staging_folder_id
+                print(f"[STORAGE] Staging Folder ID retrieved: '{staging_folder_id}'")
+
+                copy_body: dict[str, str | list[str]] = {
+                    "name": sheet_name,
+                }
+                if staging_folder_id:
+                    copy_body["parents"] = [staging_folder_id]
+
+                print(
+                    f"[STORAGE] Copying Master Template (ID: {master_template_id}) to Shared Drive..."
+                )
+                copied_file = (
+                    self.drive_service.files()  # type: ignore[attr-defined]
+                    .copy(
+                        fileId=master_template_id,
+                        body=copy_body,
+                        supportsAllDrives=True,
+                    )
+                    .execute()
+                )
+
+                new_id = copied_file["id"]
+                print(
+                    f"[STORAGE] Successfully created sheet from template. New ID: {new_id}"
+                )
+
+                # Share sheet with user email if provided
+                if user_email:
+                    print(f"[STORAGE] Granting access to user: {user_email}")
+                    user_permission = {
+                        "type": "user",
+                        "role": "writer",
+                        "emailAddress": user_email,
+                    }
+
+                    self.drive_service.permissions().create(  # type: ignore[attr-defined]
+                        fileId=new_id,
+                        body=user_permission,
+                        supportsAllDrives=True,
+                        sendNotificationEmail=False,
+                    ).execute()
+
+                self.spreadsheet = self.client.open_by_key(new_id)
+
+            self.sheet = self.spreadsheet.sheet1
             self._ensure_header_row()
-            print("[STORAGE] Google Sheets connection initialized successfully.")
+            print(
+                "[STORAGE] Google Sheets connection initialized successfully via Service Account."
+            )
 
-        except gspread.exceptions.APIError as api_err:
-            status_code = getattr(
-                getattr(api_err, "response", None), "status_code", "N/A"
-            )
-            error_text = getattr(
-                getattr(api_err, "response", None), "text", str(api_err)
-            )
-            print(f"[ERROR] Google Sheets API Error ({status_code}): {error_text}")
-            raise Exception(f"Google API call failed: {error_text}") from api_err
         except Exception as err:
             print(
                 f"[ERROR] Failed to initialize GoogleSheetsStorage: {type(err).__name__} -> {err}"
@@ -129,13 +177,11 @@ class GoogleSheetsStorage:
             return set()
 
         try:
-            # Fetch column 3 values
             raw_links = self.sheet.col_values(3)
 
             if len(raw_links) <= 1:
                 return set()
 
-            # Skip header row (index 0) and filter out empty/None values
             existing_links: set[str] = {
                 str(link).strip()
                 for link in raw_links[1:]
@@ -147,114 +193,6 @@ class GoogleSheetsStorage:
         except Exception as e:
             print(f"[WARN] Failed to load existing links from sheet: {e}")
             return set()
-
-    def _apply_theme_and_dropdowns(self, total_columns: int = 18) -> None:
-        """Applies layout styles and dropdown validation in a single batch request to prevent 429 rate limits."""
-        if not hasattr(self, "sheet") or self.sheet is None:
-            return
-
-        try:
-            end_col = gspread.utils.rowcol_to_a1(1, max(total_columns, 18)).replace(
-                "1", ""
-            )
-
-            # 1. Unmerge & Merge Top Banner
-            try:
-                self.sheet.unmerge_cells(f"A1:{end_col}1")
-            except Exception:
-                pass
-
-            self.sheet.merge_cells(f"B1:{end_col}1", merge_type="MERGE_ALL")
-
-            # 2. Set Column Widths
-            set_column_width(self.sheet, "A", 160)  # Action Status Dropdown
-            set_column_width(self.sheet, "B", 120)  # Main Picture (Compact)
-            set_column_width(self.sheet, "C", 220)  # Title
-            set_column_width(self.sheet, "D", 150)  # Website Link
-
-            # 3. Apply Cell Formatting (gspread_formatting)
-            banner_format = CellFormat(
-                backgroundColor=Color(0.31, 0.27, 0.90),
-                textFormat=TextFormat(
-                    bold=True, foregroundColor=Color(1, 1, 1), fontSize=12
-                ),
-                horizontalAlignment="LEFT",
-                verticalAlignment="MIDDLE",
-            )
-            format_cell_range(self.sheet, f"A1:{end_col}1", banner_format)
-            set_row_height(self.sheet, "1", 50)
-
-            header_format = CellFormat(
-                backgroundColor=Color(0.19, 0.18, 0.51),
-                textFormat=TextFormat(
-                    bold=True, foregroundColor=Color(1, 1, 1), fontSize=11
-                ),
-                horizontalAlignment="CENTER",
-                verticalAlignment="MIDDLE",
-            )
-            format_cell_range(self.sheet, f"A2:{end_col}2", header_format)
-            set_row_height(self.sheet, "2", 36)
-
-            data_format = CellFormat(
-                backgroundColor=Color(0.06, 0.09, 0.16),
-                textFormat=TextFormat(
-                    foregroundColor=Color(0.97, 0.98, 0.99), fontSize=10
-                ),
-                horizontalAlignment="CENTER",
-                verticalAlignment="MIDDLE",
-            )
-            format_cell_range(self.sheet, f"A3:{end_col}200", data_format)
-
-            for r in range(3, 100):
-                set_row_height(self.sheet, str(r), 65)
-
-            left_align_format = CellFormat(
-                horizontalAlignment="LEFT", verticalAlignment="MIDDLE"
-            )
-            format_cell_range(self.sheet, "C3:D200", left_align_format)
-
-            currency_format = CellFormat(
-                numberFormat=NumberFormat(type="CURRENCY", pattern="€#,##0"),
-                horizontalAlignment="RIGHT",
-                verticalAlignment="MIDDLE",
-            )
-            format_cell_range(self.sheet, "I3:J200", currency_format)
-
-            link_format = CellFormat(
-                textFormat=TextFormat(
-                    foregroundColor=Color(0.22, 0.74, 0.97), underline=True
-                ),
-                horizontalAlignment="LEFT",
-                verticalAlignment="MIDDLE",
-            )
-            format_cell_range(self.sheet, "D3:D200", link_format)
-
-            # 4. SINGLE BATCH REQUEST FOR DROPDOWN CHIPS
-            grid_range = a1_range_to_grid_range("A3:A200")
-            grid_range["sheetId"] = self.sheet.id
-            status_options = [status.value for status in StatusEnum]
-
-            dropdown_request = {
-                "setDataValidation": {
-                    "range": grid_range,
-                    "rule": {
-                        "condition": {
-                            "type": "ONE_OF_LIST",
-                            "values": [
-                                {"userEnteredValue": opt} for opt in status_options
-                            ],
-                        },
-                        "showCustomUi": True,
-                        "strict": True,
-                    },
-                }
-            }
-
-            # Execute batch update with rate-limit protection
-            self._safe_batch_update({"requests": [dropdown_request]})
-
-        except Exception as err:
-            print(f"[WARN] Failed to apply sheet styling: {err}")
 
     def _safe_batch_update(self, payload: dict, max_retries: int = 3) -> None:
         """Helper to execute batch update requests with rate-limit retries."""
@@ -271,24 +209,53 @@ class GoogleSheetsStorage:
                     raise err
 
     def clear_and_replace_listings(
-        self, listings: list, collaborators: list[str] | None = None
+        self,
+        listings: list,
+        collaborators: list[str] | None = None,
+        user_email: str | None = None,
     ) -> None:
-        """Clears sheet, populates property listings with dynamic user rating columns,
+        """Clears sheet, populates property listings, applies text wrapping,
 
-        applies dark UI theme, and attaches dropdown validation chips in 2 API calls.
+        and dynamically sets rating headers for connected users.
         """
         if not hasattr(self, "sheet") or self.sheet is None:
             return
 
         try:
-            # 1. Clear contents
             self.sheet.clear()
 
-            # 2. Setup dynamic collaborator rating columns
-            users = collaborators if collaborators else ["User 1", "User 2"]
-            rating_headers = [f"Rating ({user})" for user in users] + ["Avg Rating"]
+            # 1. Dynamically parse the primary user's name from email or gspread permissions
+            user_name = None
 
-            # Build full list of headers
+            if user_email and "@" in user_email:
+                user_name = user_email.split("@")[0].split(".")[0].capitalize()
+            elif collaborators and len(collaborators) > 0 and "@" in collaborators[0]:
+                user_name = collaborators[0].split("@")[0].split(".")[0].capitalize()
+
+            # If email is not supplied, fetch permissions safely via gspread
+            if not user_name:
+                try:
+                    perms = self.spreadsheet.list_permissions()
+                    for p in perms:
+                        # Extract emailAddress and force default to empty string
+                        email = p.get("emailAddress") or p.get("email", "")
+
+                        # Combined into a single type-safe if statement
+                        if (
+                            isinstance(email, str)
+                            and email.strip()
+                            and not email.endswith("gserviceaccount.com")
+                        ):
+                            user_name = email.split("@")[0].split(".")[0].capitalize()
+                            break
+                except Exception as perm_err:
+                    print(f"[WARN] Failed to fetch gspread permissions: {perm_err}")
+
+            if not user_name:
+                user_name = "User"
+
+            rating_headers = [f"Rating ({user_name})", "Avg Rating"]
+
             base_headers = [
                 h.value
                 for h in ColumnHeader
@@ -297,19 +264,12 @@ class GoogleSheetsStorage:
             headers = base_headers + rating_headers
             total_cols = len(headers)
 
-            # Determine column letters for the dynamic AVERAGE formula
-            first_rating_col_idx = len(base_headers) + 1  # 1-indexed
-            last_rating_col_idx = len(base_headers) + len(users)
+            rating_col_idx = len(base_headers) + 1
+            rating_col_letter = gspread.utils.rowcol_to_a1(1, rating_col_idx).replace(
+                "1", ""
+            )
 
-            first_col_letter = gspread.utils.rowcol_to_a1(
-                1, first_rating_col_idx
-            ).replace("1", "")
-            last_col_letter = gspread.utils.rowcol_to_a1(
-                1, last_rating_col_idx
-            ).replace("1", "")
-
-            # 3. Build listing rows
-            logo_url = "https://res.cloudinary.com/bgnfvyt8/image/upload/v1787740895/immoo_logo_main.png"
+            logo_url = "https://res.cloudinary.com/bgnfvyt8/image/upload/v1787783775/immoo_logo_main2.png"
             slogan_text = "   IMMOO   •   Your Personal Real Estate Intelligence & Listing Aggregator"
 
             rows = []
@@ -319,15 +279,12 @@ class GoogleSheetsStorage:
                     if hasattr(listing, "to_sheet_row")
                     else list(listing.values())
                 )
-                # Append empty placeholders for each user rating
-                row_data.extend([""] * len(users))
-                # Append dynamic average rating formula across user columns
+                row_data.append("")  # Slot for star rating chip
                 row_data.append(
-                    f'=IFERROR(AVERAGE({first_col_letter}{idx}:{last_col_letter}{idx}), "-")'
+                    f'=IFERROR(VALUE(REGEXEXTRACT({rating_col_letter}{idx}, "\\d+")), "-")'
                 )
                 rows.append(row_data)
 
-            # Single write request for all values
             payload_values = [
                 [f'=IMAGE("{logo_url}", 1)', slogan_text],
                 headers,
@@ -339,31 +296,12 @@ class GoogleSheetsStorage:
                 value_input_option=gspread.utils.ValueInputOption.user_entered,
             )
 
-            # 4. Construct complete formatting and data validation batch request
             sheet_id = self.sheet.id
             status_options = [status.value for status in StatusEnum]
-
-            dark_bg = {"red": 0.06, "green": 0.09, "blue": 0.16}
-            white_text = {
-                "foregroundColor": {"red": 0.97, "green": 0.98, "blue": 0.99},
-                "fontSize": 10,
-            }
-
-            def make_cell_format(
-                horiz_align: str, number_format: dict | None = None
-            ) -> dict:
-                fmt = {
-                    "backgroundColor": dark_bg,
-                    "textFormat": white_text,
-                    "verticalAlignment": "MIDDLE",
-                    "horizontalAlignment": horiz_align,
-                }
-                if number_format:
-                    fmt["numberFormat"] = number_format
-                return fmt
+            star_options = ["⭐ 1", "⭐ 2", "⭐ 3", "⭐ 4", "⭐ 5"]
 
             requests = [
-                # Merge B1:R1 Banner
+                # Top Banner Merge
                 {
                     "mergeCells": {
                         "range": {
@@ -376,31 +314,7 @@ class GoogleSheetsStorage:
                         "mergeType": "MERGE_ALL",
                     }
                 },
-                # Column Widths
-                {
-                    "updateDimensionProperties": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "COLUMNS",
-                            "startIndex": 0,
-                            "endIndex": 1,
-                        },
-                        "properties": {"pixelSize": 190},
-                        "fields": "pixelSize",
-                    }
-                },  # A: Status
-                {
-                    "updateDimensionProperties": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "COLUMNS",
-                            "startIndex": 1,
-                            "endIndex": 2,
-                        },
-                        "properties": {"pixelSize": 120},
-                        "fields": "pixelSize",
-                    }
-                },  # B: Main Picture
+                # Column C (Title) Width -> 350px
                 {
                     "updateDimensionProperties": {
                         "range": {
@@ -409,10 +323,11 @@ class GoogleSheetsStorage:
                             "startIndex": 2,
                             "endIndex": 3,
                         },
-                        "properties": {"pixelSize": 380},
+                        "properties": {"pixelSize": 350},
                         "fields": "pixelSize",
                     }
-                },  # C: Title
+                },
+                # Column D (Website Link) Width -> 180px
                 {
                     "updateDimensionProperties": {
                         "range": {
@@ -421,10 +336,11 @@ class GoogleSheetsStorage:
                             "startIndex": 3,
                             "endIndex": 4,
                         },
-                        "properties": {"pixelSize": 150},
+                        "properties": {"pixelSize": 180},
                         "fields": "pixelSize",
                     }
-                },  # D: Link
+                },
+                # Column E (Location) Width -> 200px
                 {
                     "updateDimensionProperties": {
                         "range": {
@@ -433,10 +349,10 @@ class GoogleSheetsStorage:
                             "startIndex": 4,
                             "endIndex": 5,
                         },
-                        "properties": {"pixelSize": 170},
+                        "properties": {"pixelSize": 200},
                         "fields": "pixelSize",
                     }
-                },  # E: Location
+                },
                 # Row Heights
                 {
                     "updateDimensionProperties": {
@@ -474,7 +390,59 @@ class GoogleSheetsStorage:
                         "fields": "pixelSize",
                     }
                 },
-                # Row 1 Banner Format
+                # Global Dark Theme Styling with ENFORCED WRAP Strategy on Data Cells
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 2,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": total_cols,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": {
+                                    "red": 0.06,
+                                    "green": 0.09,
+                                    "blue": 0.16,
+                                },
+                                "textFormat": {
+                                    "foregroundColor": {
+                                        "red": 0.97,
+                                        "green": 0.98,
+                                        "blue": 0.99,
+                                    },
+                                    "fontSize": 10,
+                                },
+                                "verticalAlignment": "MIDDLE",
+                                "horizontalAlignment": "CENTER",
+                                "wrapStrategy": "WRAP",
+                            }
+                        },
+                        "fields": "userEnteredFormat",
+                    }
+                },
+                # Left-Align Title (Col C) & Website Link (Col D)
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 2,
+                            "endRowIndex": 200,
+                            "startColumnIndex": 2,
+                            "endColumnIndex": 4,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "horizontalAlignment": "LEFT",
+                                "wrapStrategy": "WRAP",
+                            }
+                        },
+                        "fields": "userEnteredFormat.horizontalAlignment,userEnteredFormat.wrapStrategy",
+                    }
+                },
+                # Top Banner Formatting
                 {
                     "repeatCell": {
                         "range": {
@@ -507,7 +475,7 @@ class GoogleSheetsStorage:
                         "fields": "userEnteredFormat",
                     }
                 },
-                # Row 2 Header Format
+                # Header Row Formatting
                 {
                     "repeatCell": {
                         "range": {
@@ -540,111 +508,13 @@ class GoogleSheetsStorage:
                         "fields": "userEnteredFormat",
                     }
                 },
-                # LEFT ALIGNED DATA COLUMNS (Title, Link, Location, Drawbacks, Highlights) -> C, D, E, N, O
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 2,
-                            "endRowIndex": 200,
-                            "startColumnIndex": 2,
-                            "endColumnIndex": 5,
-                        },
-                        "cell": {"userEnteredFormat": make_cell_format("LEFT")},
-                        "fields": "userEnteredFormat",
-                    }
-                },
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 2,
-                            "endRowIndex": 200,
-                            "startColumnIndex": 13,
-                            "endColumnIndex": 15,
-                        },
-                        "cell": {"userEnteredFormat": make_cell_format("LEFT")},
-                        "fields": "userEnteredFormat",
-                    }
-                },
-                # CENTER ALIGNED DATA COLUMNS -> A, B, F, G, H, K, L, M, and Dynamic Ratings
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 2,
-                            "endRowIndex": 200,
-                            "startColumnIndex": 0,
-                            "endColumnIndex": 2,
-                        },
-                        "cell": {"userEnteredFormat": make_cell_format("CENTER")},
-                        "fields": "userEnteredFormat",
-                    }
-                },
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 2,
-                            "endRowIndex": 200,
-                            "startColumnIndex": 5,
-                            "endColumnIndex": 8,
-                        },
-                        "cell": {"userEnteredFormat": make_cell_format("CENTER")},
-                        "fields": "userEnteredFormat",
-                    }
-                },
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 2,
-                            "endRowIndex": 200,
-                            "startColumnIndex": 10,
-                            "endColumnIndex": 13,
-                        },
-                        "cell": {"userEnteredFormat": make_cell_format("CENTER")},
-                        "fields": "userEnteredFormat",
-                    }
-                },
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 2,
-                            "endRowIndex": 200,
-                            "startColumnIndex": 15,
-                            "endColumnIndex": total_cols,
-                        },
-                        "cell": {"userEnteredFormat": make_cell_format("CENTER")},
-                        "fields": "userEnteredFormat",
-                    }
-                },
-                # RIGHT ALIGNED & CURRENCY COLUMNS -> I, J
-                {
-                    "repeatCell": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "startRowIndex": 2,
-                            "endRowIndex": 200,
-                            "startColumnIndex": 8,
-                            "endColumnIndex": 10,
-                        },
-                        "cell": {
-                            "userEnteredFormat": make_cell_format(
-                                "RIGHT", {"type": "CURRENCY", "pattern": "€#,##0"}
-                            )
-                        },
-                        "fields": "userEnteredFormat",
-                    }
-                },
-                # Dropdown Validation Chips for Column A (A3:A200)
+                # Status Dropdown Chips
                 {
                     "setDataValidation": {
                         "range": {
                             "sheetId": sheet_id,
                             "startRowIndex": 2,
-                            "endRowIndex": 200,
+                            "endRowIndex": max(len(rows) + 2, 200),
                             "startColumnIndex": 0,
                             "endColumnIndex": 1,
                         },
@@ -660,13 +530,169 @@ class GoogleSheetsStorage:
                         },
                     }
                 },
+                # Rating Dropdown Chips
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 2,
+                            "endRowIndex": max(len(rows) + 2, 200),
+                            "startColumnIndex": rating_col_idx - 1,
+                            "endColumnIndex": rating_col_idx,
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "ONE_OF_LIST",
+                                "values": [
+                                    {"userEnteredValue": opt} for opt in star_options
+                                ],
+                            },
+                            "showCustomUi": True,
+                            "strict": True,
+                        },
+                    }
+                },
             ]
 
-            # Execute batch update
             self._safe_batch_update({"requests": requests})
-            print(
-                f"[STORAGE] Successfully populated listings with collaborator columns: {users}"
-            )
+            print(f"[STORAGE] Populated sheet with rating column for user: {user_name}")
 
         except Exception as e:
             print(f"[ERROR] Failed to replace listings in Google Sheets: {e}")
+
+    def add_collaborator_column(self, collaborator_name: str) -> None:
+        """Dynamically inserts a new rating column before 'Avg Rating', applies soft warning
+
+        protection, and updates the 'Avg Rating' column formulas to compute the average
+        across all reviewer rating columns.
+        """
+        if not hasattr(self, "sheet") or self.sheet is None:
+            raise ValueError("Spreadsheet connection is not initialized.")
+
+        headers = self.sheet.row_values(2)
+        formatted_name = collaborator_name.strip().capitalize()
+        new_header = f"Rating ({formatted_name})"
+
+        if new_header in headers:
+            print(f"[STORAGE] Column '{new_header}' already exists.")
+            return
+
+        # 1. Locate column positions
+        avg_idx = (
+            headers.index("Avg Rating") + 1
+            if "Avg Rating" in headers
+            else len(headers) + 1
+        )
+
+        # 2. Insert empty column & set new header value
+        self.sheet.insert_cols([[""]], col=avg_idx)
+        self.sheet.update_cell(2, avg_idx, new_header)
+
+        sheet_id = self.sheet.id
+        star_options = ["⭐ 1", "⭐ 2", "⭐ 3", "⭐ 4", "⭐ 5"]
+
+        # 3. Calculate dynamic A1 range for rating columns to compute Avg Rating formula
+        # Find index of the very first rating column (e.g., Rating (Nicolas))
+        rating_headers = [h for h in headers if h.startswith("Rating")]
+        first_rating_idx = (
+            headers.index(rating_headers[0]) + 1 if rating_headers else avg_idx
+        )
+
+        first_rating_letter = gspread.utils.rowcol_to_a1(1, first_rating_idx).replace(
+            "1", ""
+        )
+        last_rating_letter = gspread.utils.rowcol_to_a1(1, avg_idx).replace("1", "")
+        avg_rating_letter = gspread.utils.rowcol_to_a1(1, avg_idx + 1).replace("1", "")
+
+        # 4. Prepare formula updates for Avg Rating column (Rows 3 to 200)
+        avg_formula_updates = []
+        for row in range(3, 201):
+            formula = (
+                f"=IFERROR(AVERAGE(ARRAYFORMULA(VALUE(REGEXEXTRACT("
+                f"FILTER({first_rating_letter}{row}:{last_rating_letter}{row}, "
+                f'{first_rating_letter}{row}:{last_rating_letter}{row}<>""), "\\d+")))), "-")'
+            )
+            avg_formula_updates.append([formula])
+
+        # Batch update the Avg Rating formulas
+        self.sheet.update(
+            range_name=f"{avg_rating_letter}3:{avg_rating_letter}200",
+            values=avg_formula_updates,
+            raw=False,
+        )
+
+        # 5. UI Formatting, Data Validation & Soft Warning Protection
+        requests = [
+            # Header styling (Row 2)
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 2,
+                        "startColumnIndex": avg_idx - 1,
+                        "endColumnIndex": avg_idx,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": {
+                                "red": 0.19,
+                                "green": 0.18,
+                                "blue": 0.51,
+                            },
+                            "textFormat": {
+                                "bold": True,
+                                "foregroundColor": {"red": 1, "green": 1, "blue": 1},
+                                "fontSize": 11,
+                            },
+                            "horizontalAlignment": "CENTER",
+                            "verticalAlignment": "MIDDLE",
+                        }
+                    },
+                    "fields": "userEnteredFormat",
+                }
+            },
+            # Star rating dropdown chips (Rows 3-200)
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "startRowIndex": 2,
+                        "endRowIndex": 200,
+                        "startColumnIndex": avg_idx - 1,
+                        "endColumnIndex": avg_idx,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_LIST",
+                            "values": [
+                                {"userEnteredValue": opt} for opt in star_options
+                            ],
+                        },
+                        "showCustomUi": True,
+                        "strict": True,
+                    },
+                }
+            },
+            # Soft Protection Warning Prompt
+            {
+                "addProtectedRange": {
+                    "protectedRange": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 2,
+                            "endRowIndex": 200,
+                            "startColumnIndex": avg_idx - 1,
+                            "endColumnIndex": avg_idx,
+                        },
+                        "description": f"Rating Column - {formatted_name}",
+                        "warningOnly": True,
+                    }
+                }
+            },
+        ]
+
+        self._safe_batch_update({"requests": requests})
+        print(
+            f"[STORAGE] Added rating column for '{formatted_name}' and updated Avg Rating formulas."
+        )

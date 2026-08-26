@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from src.config import Config, SearchPreferences
+from src.config import Config, SearchPreferences, settings
 from src.domain.models import RealEstateListing
 from src.services.ai_analyzer import GeminiAnalyzer
 from src.services.storage import GoogleSheetsStorage
@@ -17,7 +17,7 @@ def clean_num(val: float | int) -> int | float:
     return int(f_val) if f_val.is_integer() else f_val
 
 
-def run_pipeline(payload, access_token: str = "") -> None:
+def run_pipeline(payload, user_email: str = "") -> GoogleSheetsStorage | None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     payload_dict = (
@@ -36,18 +36,27 @@ def run_pipeline(payload, access_token: str = "") -> None:
     streamestate_key = config.streamestate_api_key.get_secret_value()
     gemini_key = config.gemini_api_key.get_secret_value()
 
-    # 2. Instantiate storage client
+    # 2. Instantiate storage client via Service Account
     storage = None
     existing_links = set()
-    if access_token:
-        try:
-            storage = GoogleSheetsStorage(
-                access_token=access_token, sheet_name=config.google_sheet_name
-            )
-            existing_links = storage.load_existing_links()
-        except Exception as e:
-            print(f"[WARN] Storage initialization skipped or failed: {e}")
+    try:
+        spreadsheet_id = (
+            getattr(payload, "spreadsheet_id", None)
+            if not isinstance(payload, dict)
+            else payload.get("spreadsheet_id")
+        )
 
+        storage = GoogleSheetsStorage(
+            master_template_id=settings.google_sheets_master_template_id,
+            user_email=user_email,
+            spreadsheet_id=spreadsheet_id,
+            sheet_name=settings.google_sheet_name,
+        )
+        existing_links = storage.load_existing_links()
+    except Exception as e:
+        print(f"[WARN] Storage initialization skipped or failed: {e}")
+
+    # Initialize new_listings HERE so it is safe in all scopes
     new_listings: list[RealEstateListing] = []
 
     # 3. Check for MOCK mode override
@@ -103,13 +112,10 @@ def run_pipeline(payload, access_token: str = "") -> None:
             if not isinstance(prop, dict):
                 continue
 
-            # Skip only if property is explicitly flagged as expired at top level
             if prop.get("expired") is True:
                 continue
 
             adverts = prop.get("adverts") or []
-
-            # Filter active adverts safely
             active_adverts = [
                 adv
                 for adv in adverts
@@ -133,22 +139,13 @@ def run_pipeline(payload, access_token: str = "") -> None:
             room_num = int(prop.get("room") or primary_advert.get("room") or 0)
             bedroom_num = int(prop.get("bedroom") or primary_advert.get("bedroom") or 0)
 
-            # APPLY FILTERS SAFELY (Allow 0 if metadata omitted the room count from API)
             if size_sqm and size_sqm < prefs.min_space:
-                print(
-                    f"[SKIP] Surface too small: {size_sqm} m² < {prefs.min_space} m² ({link})"
-                )
                 continue
             if room_num > 0 and room_num < prefs.min_rooms:
-                print(f"[SKIP] Too few rooms: {room_num} < {prefs.min_rooms} ({link})")
                 continue
             if bedroom_num > 0 and bedroom_num < prefs.min_bedrooms:
-                print(
-                    f"[SKIP] Too few bedrooms: {bedroom_num} < {prefs.min_bedrooms} ({link})"
-                )
                 continue
 
-            # Format location safely
             city_info = prop.get("city") or {}
             city_name = str(
                 city_info.get("name", "") if isinstance(city_info, dict) else ""
@@ -166,7 +163,6 @@ def run_pipeline(payload, access_token: str = "") -> None:
             else:
                 formatted_location = prefs.locations[0]
 
-            # Images & DPE
             pictures = prop.get("pictures") or primary_advert.get("pictures") or []
             main_pic = (
                 pictures[0] if isinstance(pictures, list) and len(pictures) > 0 else ""
@@ -179,7 +175,6 @@ def run_pipeline(payload, access_token: str = "") -> None:
                 else "N/A"
             )
 
-            # Land surface check
             land_surface = (
                 primary_advert.get("landSurface") or prop.get("landSurface") or 0
             )
@@ -188,7 +183,6 @@ def run_pipeline(payload, access_token: str = "") -> None:
             except (ValueError, TypeError):
                 has_garden = False
 
-            # Floor check
             floor_val = (
                 prop.get("floor")
                 if prop.get("floor") is not None
@@ -237,3 +231,5 @@ def run_pipeline(payload, access_token: str = "") -> None:
         print(f"Synced {len(new_listings)} active listings to Google Sheets.")
     else:
         print("[WARN] Google Sheets storage client is not connected.")
+
+    return storage  # Return storage instance so route handler gets spreadsheet ID
