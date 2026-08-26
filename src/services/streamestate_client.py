@@ -1,12 +1,11 @@
 from typing import Any
 from urllib.parse import quote
+
 import requests
 
 
 class StreamEstateError(Exception):
     """Raised when Stream Estate API request fails."""
-
-    pass
 
 
 class StreamEstateClient:
@@ -78,11 +77,11 @@ class StreamEstateClient:
         )
 
         if min_price > 0:
-            params.append(("budgetMin", str(int(min_price))))
+            params.append(("budgetMin", str(min_price)))
         if max_price > 0:
-            params.append(("budgetMax", str(int(max_price))))
+            params.append(("budgetMax", str(max_price)))
         if min_space > 0:
-            params.append(("surfaceMin", str(int(min_space))))
+            params.append(("surfaceMin", str(min_space)))
 
         headers = {
             "Accept": "application/json",

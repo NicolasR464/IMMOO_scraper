@@ -11,8 +11,6 @@ from bs4 import BeautifulSoup
 class LocationNotFoundError(Exception):
     """Raised when a location cannot be resolved to a valid SeLoger placeId."""
 
-    pass
-
 
 class ZenRowsScraper:
     """Scrapes real estate listings using ZenRows HTTP API."""

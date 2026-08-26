@@ -21,9 +21,7 @@ class SearchPayload(BaseModel):
 @app.post("/api/search")
 async def search_listings(
     payload: SearchPayload,
-    authorization: str | None = Header(
-        default=None
-    ),  # Explicitly parses HTTP Authorization Header
+    authorization: str | None = Header(default=None),
 ):
     try:
         access_token = ""
