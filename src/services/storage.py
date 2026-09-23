@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from pathlib import Path
@@ -25,6 +26,9 @@ from src.enums.table import ColumnHeader, StatusEnum
 # Automatically resolves to the root folder of your project
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DEFAULT_SERVICE_ACCOUNT_PATH = str(BASE_DIR / "service_account.json")
+# Preferred over the file above: the credentials JSON passed directly as an
+# env var (see scripts/fetch-secrets.sh), so no key file needs to exist on disk.
+SERVICE_ACCOUNT_JSON_ENV_VAR = "GOOGLE_SERVICE_ACCOUNT_JSON"
 
 
 class StaticAccessTokenCredentials(Credentials):
@@ -76,20 +80,29 @@ class GoogleSheetsStorage:
         service_account_file: str = DEFAULT_SERVICE_ACCOUNT_PATH,
     ) -> None:
         """Initialize Google Sheets client using backend Service Account."""
-        if not os.path.exists(service_account_file):
-            raise FileNotFoundError(
-                f"Service account file '{service_account_file}' not found."
-            )
-
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
 
-        # 1. Authenticate with Service Account
-        self.creds = service_account.Credentials.from_service_account_file(
-            service_account_file, scopes=scopes
-        )
+        # 1. Authenticate with Service Account — prefer the credentials JSON
+        # passed directly via env var (no file ever touches disk); fall back
+        # to a file path for environments that still mount one that way.
+        service_account_json = os.environ.get(SERVICE_ACCOUNT_JSON_ENV_VAR)
+        if service_account_json:
+            info = json.loads(service_account_json)
+            self.creds = service_account.Credentials.from_service_account_info(
+                info, scopes=scopes
+            )
+        else:
+            if not os.path.exists(service_account_file):
+                raise FileNotFoundError(
+                    f"Service account file '{service_account_file}' not found, "
+                    f"and {SERVICE_ACCOUNT_JSON_ENV_VAR} is not set."
+                )
+            self.creds = service_account.Credentials.from_service_account_file(
+                service_account_file, scopes=scopes
+            )
         self.client = gspread.authorize(self.creds)
         self.drive_service = build("drive", "v3", credentials=self.creds)
 
