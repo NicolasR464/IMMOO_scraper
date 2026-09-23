@@ -1,6 +1,6 @@
 # IMMOO Scraper Service
 
-FastAPI background worker for the IMMOO real estate pipeline. Managed with `uv`.
+FastAPI background worker for the IMMOO real estate pipeline.
 
 ## Quickstart
 
@@ -32,20 +32,3 @@ GOOGLE_SHEET_NAME=ADs_list
 * **`GET /api/health`** — Health check & app version.
 * **`POST /api/scrape`** — Triggers background scraper task.
 * **Docs:** `http://localhost:8000/docs`
-
-## Example Request
-
-```bash
-curl -X POST "http://localhost:8000/api/scrape" \
-  -H "Authorization: Bearer sk_live_default_secret_key" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "locations": ["77300", "77210"],
-    "minPrice": 400000,
-    "maxPrice": 550000,
-    "minSpace": 80,
-    "minRooms": 4,
-    "minBedrooms": 3
-  }'
-
-```

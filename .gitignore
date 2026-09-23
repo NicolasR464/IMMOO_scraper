@@ -5,3 +5,4 @@ output/
 *.html
 
 service_account.json
+.direnv/
